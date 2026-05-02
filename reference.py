@@ -5,10 +5,10 @@ import re
 import boto3
 from botocore.client import Config
 
-S3_ENDPOINT = "http://10.105.110.131:80"
-S3_ACCESS_KEY = "minio"
-S3_SECRET_KEY = "minio123"
-LAKE_BUCKET = "openlake"
+S3_ENDPOINT = ""
+S3_ACCESS_KEY = ""
+S3_SECRET_KEY = ""
+LAKE_BUCKET = ""
 
 s3 = boto3.client(
     "s3",
