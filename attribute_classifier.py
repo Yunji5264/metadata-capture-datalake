@@ -1,4 +1,6 @@
 import binascii
+import re
+import unicodedata
 
 from pandas.api.types import is_object_dtype, is_string_dtype
 from shapely import wkb
@@ -8,15 +10,60 @@ from temporal_detector import *
 from indicator_detector import *
 from reference import *
 
-DEFAULT_COUNTRY_SPATIAL_ATTRIBUTE = {
-    "columns": "country",
-    "description": "dataset country scope",
-    "type": "constant",
-    "granularity": "country",
-    "confidence": 1.0,
-    "scope_values": ["France"],
-    "evidence": "Default country-level spatial scope for the French data lake.",
+_FRANCE_VALUE_ALIASES = {
+    "france",
+    "fr",
+    "fra",
+    "republique_francaise",
+    "republique_france",
 }
+
+_COUNTRY_COLUMN_NAME_HINTS = {
+    "country",
+    "pays",
+    "nation",
+    "etat",
+    "state",
+    "territoire_national",
+}
+
+
+def _normalize_country_token(value) -> str:
+    if pd.isna(value):
+        return ""
+    text = str(value).strip().lower()
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r"[^a-z0-9]+", "_", text)
+    return re.sub(r"_+", "_", text).strip("_")
+
+
+def _is_france_country_series(s: pd.Series) -> bool:
+    values = {
+        _normalize_country_token(v)
+        for v in s.dropna().unique()
+        if _normalize_country_token(v)
+    }
+    return bool(values) and values.issubset(_FRANCE_VALUE_ALIASES)
+
+
+def _looks_like_country_colname(col: str) -> bool:
+    norm = normalise_colname(col)
+    return norm in _COUNTRY_COLUMN_NAME_HINTS or any(
+        token in norm.split("_")
+        for token in ("country", "pays", "nation")
+    )
+
+
+def _country_spatial_entry(df: pd.DataFrame, col: str, description: str = "") -> dict:
+    return {
+        "columns": col,
+        "description": description or "country spatial attribute",
+        "type": str(df[col].dtype),
+        "granularity": "country",
+        "confidence": 0.98,
+        "evidence": "Real dataset column is a country spatial attribute.",
+    }
 
 
 def find_geometry_columns(df: pd.DataFrame) -> list[str]:
@@ -400,6 +447,13 @@ def classify_attributes_with_semantic_helper(
 
 
     spatial_cols = spatial_cols + _col_list_from_sem(semantic_res, semantic_res["is_spatial"] == True)
+
+    if not spatial_cols:
+        for col in df.columns:
+            if (_looks_like_country_colname(col) and df[col].notna().any()) or _is_france_country_series(df[col]):
+                spatial_cols.append(col)
+                break
+
     temporal_cols = _col_list_from_sem(semantic_res, semantic_res["is_temporal"] == True)
     indicator_qual_cols = _col_list_from_sem(
         semantic_res, (semantic_res["is_indicator"] == True) & (semantic_res["indicator_type"] == "Qualitative")
@@ -473,6 +527,14 @@ def classify_attributes_with_semantic_helper(
         # Guard 0: skip columns that are known geometry-like
         # Intentionally excluded from both spatial and other buckets
         if col in geom_cols:
+            continue
+
+        if (_looks_like_country_colname(col) and s.notna().any()) or _is_france_country_series(s):
+            results["spatial"].append(
+                _country_spatial_entry(df2, col, _desc(semantic_res, col))
+            )
+            consumed.add(col)
+            assigned = True
             continue
 
         # Guard 1: shapely/object geometry detection only for object-like series
@@ -574,13 +636,16 @@ def classify_attributes_with_semantic_helper(
                     best = match_series_to_ref_levels(
                         s, filtered, sample_size=sample_size
                     )
+                    mixed = detect_mixed_spatial_levels(
+                        s, filtered, sample_size=sample_size
+                    )
 
                     if best and best["ratio"] >= min_ratio:
-                        results["spatial"].append({
+                        entry = {
                             "columns": col,
                             "description": des,
                             "type": str(s.dtype),
-                            "granularity": best["level"],
+                            "granularity": mixed.get("most_specific_level") or best["level"],
                             "matched_by": best["by"],
                             "confidence": min(
                                 0.99, 0.7 + 0.3 * best["ratio"]
@@ -590,6 +655,24 @@ def classify_attributes_with_semantic_helper(
                                 f"ref match by {best['by']} "
                                 f"({round(best['ratio'] * 100)}%)."
                             ),
+                        }
+                        if mixed:
+                            entry.update(mixed)
+                            entry["evidence"] += " Column contains multiple spatial hierarchy levels."
+                        results["spatial"].append(entry)
+                        assigned = True
+                        continue
+
+                    elif mixed:
+                        results["spatial"].append({
+                            "columns": col,
+                            "description": des,
+                            "type": str(s.dtype),
+                            "granularity": mixed["most_specific_level"],
+                            "matched_by": "mixed_level_values",
+                            "confidence": 0.75,
+                            "evidence": "Spatial values matched multiple hierarchy levels in the same column.",
+                            **mixed,
                         })
                         assigned = True
                         continue
@@ -615,6 +698,13 @@ def classify_attributes_with_semantic_helper(
                     if ref_sets
                     else None
                 )
+                mixed = (
+                    detect_mixed_spatial_levels(
+                        s, ref_sets, sample_size=sample_size
+                    )
+                    if ref_sets
+                    else {}
+                )
                 generic_min = max(min_ratio, 0.80)
 
                 if best and best["ratio"] >= generic_min:
@@ -622,7 +712,7 @@ def classify_attributes_with_semantic_helper(
                         "columns": col,
                         "description": des,
                         "type": str(s.dtype),
-                        "granularity": best["level"],
+                        "granularity": mixed.get("most_specific_level") or best["level"],
                         "matched_by": best["by"],
                         "confidence": min(
                             0.99, 0.68 + 0.32 * best["ratio"]
@@ -631,6 +721,23 @@ def classify_attributes_with_semantic_helper(
                             f"Generic geo gate → ref match by {best['by']} "
                             f"({round(best['ratio'] * 100)}%)."
                         ),
+                    })
+                    if mixed:
+                        results["spatial"][-1].update(mixed)
+                        results["spatial"][-1]["evidence"] += " Column contains multiple spatial hierarchy levels."
+                    assigned = True
+                    continue
+
+                elif mixed:
+                    results["spatial"].append({
+                        "columns": col,
+                        "description": des,
+                        "type": str(s.dtype),
+                        "granularity": mixed["most_specific_level"],
+                        "matched_by": "mixed_level_values",
+                        "confidence": 0.75,
+                        "evidence": "Spatial values matched multiple hierarchy levels in the same column.",
+                        **mixed,
                     })
                     assigned = True
                     continue
@@ -726,8 +833,5 @@ def classify_attributes_with_semantic_helper(
         "sheet_names": sheet_names or [],
         "require_name_hint_for_geoformats": require_name_hint_for_geoformats,
     }
-
-    if not any(att.get("granularity") == "country" for att in results["spatial"]):
-        results["spatial"].insert(0, dict(DEFAULT_COUNTRY_SPATIAL_ATTRIBUTE))
 
     return results

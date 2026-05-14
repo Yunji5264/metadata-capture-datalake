@@ -2,6 +2,7 @@ from reference import TEMP_NAME_PATTERNS
 from datetime import date, timedelta
 from general_function import *
 import calendar
+import re
 
 
 def get_scope(granularities, hierarchies) -> List[str]:
@@ -192,4 +193,40 @@ def extract_label_ranges(granularity: str, tokens):
             cur_end_date    = r['end']
     ranges.append((cur_start_label, cur_end_label))
     return ranges
+
+
+def extract_temporal_hints_from_text(text: str) -> List[dict]:
+    """
+    Extract temporal hints from a dataset/file name.
+
+    Returns dictionaries with:
+      - granularity: year | quarter | semester | month | week | date
+      - value: normalized label
+      - confidence/evidence for downstream metadata traceability
+    """
+    if not text:
+        return []
+
+    search_text = re.sub(r"[_\-]+", " ", str(text))
+    granularities = ["date", "week", "month", "quarter", "semester", "year"]
+    hits = []
+    seen = set()
+
+    for granularity in granularities:
+        ranges = extract_label_ranges(granularity, [search_text])
+        for start, end in ranges:
+            if start != end:
+                continue
+            key = (granularity, start)
+            if key in seen:
+                continue
+            seen.add(key)
+            hits.append({
+                "granularity": granularity,
+                "value": start,
+                "confidence": 0.95,
+                "evidence": f"Filename fallback: detected {granularity} '{start}'."
+            })
+
+    return hits
 

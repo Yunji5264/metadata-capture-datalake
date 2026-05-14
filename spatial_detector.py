@@ -682,6 +682,119 @@ def match_series_to_ref_levels(
 
     return best if best["level"] is not None else {}
 
+
+_COUNTRY_NAME_ALIASES = {"france", "fr", "republique francaise", "metropole"}
+_CANONICAL_SPATIAL_ORDER = [
+    "country",
+    "region",
+    "academie",
+    "departement",
+    "arrondissement_departemental",
+    "epci",
+    "canton",
+    "commune",
+    "arrondissement_communal",
+    "iris",
+]
+
+
+def _canonical_spatial_level(level: str) -> str:
+    return SPATIAL_NAME_MAP.get(level, level)
+
+
+def _spatial_specificity(level: str) -> int:
+    canonical = _canonical_spatial_level(level)
+    try:
+        return _CANONICAL_SPATIAL_ORDER.index(canonical)
+    except ValueError:
+        return -1
+
+
+def _normalise_code_for_level(value: str, codes_set: set[str]) -> str:
+    base = norm_code(value)
+    if re.search(r"[A-Za-z]", base):
+        return base
+
+    lengths = sorted({len(str(c)) for c in codes_set})
+    candidates = [base] + [
+        base.zfill(length)
+        for length in lengths
+        if length >= len(base)
+    ]
+    return next((c for c in candidates if c in codes_set), base)
+
+
+def detect_mixed_spatial_levels(
+    s: pd.Series,
+    ref_sets: Dict[str, Dict[str, Any]],
+    sample_size: int = 500,
+) -> Dict[str, Any]:
+    """
+    Detect a spatial column containing values from multiple hierarchy levels.
+
+    Example: one column containing 'France' and region names/codes.
+    Returns an empty dict when fewer than two levels are detected.
+    """
+    sample = s.dropna().drop_duplicates()
+    if sample.empty:
+        return {}
+
+    sample = sample.astype(str).str.strip().head(sample_size)
+    values_by_level: Dict[str, set[str]] = {}
+
+    for raw_value in sample:
+        if not raw_value:
+            continue
+
+        name_value = norm_name(raw_value)
+        if name_value in _COUNTRY_NAME_ALIASES:
+            values_by_level.setdefault("country", set()).add("France")
+            continue
+
+        matched_levels = []
+        for level, sets in ref_sets.items():
+            canonical_level = _canonical_spatial_level(level)
+            codes_set = sets.get("codes", set()) or set()
+            names_set = sets.get("names", set()) or set()
+
+            code_value = _normalise_code_for_level(raw_value, codes_set)
+            if code_value in codes_set:
+                matched_levels.append((canonical_level, code_value))
+                continue
+
+            if name_value in names_set:
+                matched_levels.append((canonical_level, raw_value))
+
+        if not matched_levels:
+            continue
+
+        # Keep the most specific matching level for ambiguous codes.
+        level, value = max(matched_levels, key=lambda item: _spatial_specificity(item[0]))
+        values_by_level.setdefault(level, set()).add(str(value))
+
+    if len(values_by_level) < 2:
+        return {}
+
+    levels = sorted(values_by_level, key=_spatial_specificity)
+    most_specific = levels[-1]
+    aggregate_values = [
+        {"level": level, "value": value}
+        for level in levels
+        if level != most_specific
+        for value in sorted(values_by_level[level])
+    ]
+
+    return {
+        "contains_aggregate_values": bool(aggregate_values),
+        "mixed_levels": levels,
+        "aggregate_values": aggregate_values,
+        "values_by_level": {
+            level: sorted(values)
+            for level, values in values_by_level.items()
+        },
+        "most_specific_level": most_specific,
+    }
+
 # --------------- Spatial name-based extraction (filename/colname/sheetname) -
 
 # Code patterns aligned with FR practice (incl. 2A/2B and 971–976).

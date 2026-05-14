@@ -2,6 +2,7 @@ import os
 import json
 import inspect
 import hashlib
+import io
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Generator, Iterable
@@ -18,7 +19,7 @@ from reference import (
     LAKE_BUCKET,
     s3,
     minio_key,
-    object_exists,
+    object_exists as ref_object_exists,
 )
 from general_function import (
     copy_input_object_to_rawzone,
@@ -117,6 +118,16 @@ def iter_data_files(root, allow_exts=None):
     Example yielded key:
         input_data/fr-esr-parcoursup_2021.csv
     """
+
+    def _is_sidecar_metadata_file(filename: str) -> bool:
+        lower = filename.lower()
+        return (
+            lower.endswith("_metadata.csv")
+            or lower.endswith("_metadata.tsv")
+            or lower.endswith(".metadata.csv")
+            or lower.endswith(".metadata.tsv")
+        )
+
     allow = {e.lower() for e in (allow_exts or DEFAULT_EXTS)}
     prefix = minio_key(root).rstrip("/") + "/"
 
@@ -131,6 +142,8 @@ def iter_data_files(root, allow_exts=None):
 
             filename = key.split("/")[-1]
             if filename.startswith(".") or filename.endswith(".ini"):
+                continue
+            if _is_sidecar_metadata_file(filename):
                 continue
 
             ext = "." + filename.split(".")[-1].lower() if "." in filename else ""
@@ -165,7 +178,7 @@ def _outputs_exist_for(p: str) -> bool:
     filename = p.split("/")[-1]
     meta_path = METADATA_DIR / f"{filename}.metadata.json"
     perf_path = PERF_DIR / f"{filename}.perf.json"
-    return object_exists(meta_path) and object_exists(perf_path)
+    return ref_object_exists(meta_path) and ref_object_exists(perf_path)
 
 
 def _rawzone_object_exists(entry: Dict[str, Any]) -> bool:
@@ -177,7 +190,7 @@ def _rawzone_object_exists(entry: Dict[str, Any]) -> bool:
         return False
 
     try:
-        return object_exists(rawzone_path)
+        return ref_object_exists(rawzone_path)
     except Exception:
         return False
 
@@ -212,10 +225,10 @@ def was_processed_successfully(p: str, catalog: Dict[str, Any]) -> bool:
             meta_path = e.get("metadataPath")
             perf_path = e.get("perfPath")
 
-            if not meta_path or not object_exists(meta_path):
+            if not meta_path or not ref_object_exists(meta_path):
                 return False
 
-            if not perf_path or not object_exists(perf_path):
+            if not perf_path or not ref_object_exists(perf_path):
                 return False
 
             if not e.get("rawzoneCopied", False):
@@ -363,7 +376,7 @@ def load_catalog() -> Dict[str, Any]:
     """
     Load existing catalog from MinIO or return an empty skeleton.
     """
-    if object_exists(CATALOG_PATH):
+    if ref_object_exists(CATALOG_PATH):
         return read_json_object(CATALOG_PATH)
     return {"datasets": []}
 
@@ -393,15 +406,44 @@ def write_catalog(catalog: Dict[str, Any]) -> None:
 
 # ------------------------------- Processing I/O -------------------------------
 
+def upload_enriched_rawzone_if_available(ds: Dataset) -> Optional[bool]:
+    """
+    Upload a dataframe enriched during construct_dataset to raw zone.
+
+    Returns True if an enriched object was written, None if there is no enriched
+    dataframe and the caller should fall back to copying the original object.
+    """
+    df = getattr(ds, "_rawzone_enriched_df", None)
+    if df is None:
+        return None
+
+    ext = (ds.fileType or "").lower()
+    if ext not in {".csv", ".tsv"}:
+        return None
+
+    sep = "\t" if ext == ".tsv" else ","
+    buf = io.StringIO()
+    df.to_csv(buf, index=False, sep=sep)
+    s3.put_object(
+        Bucket=LAKE_BUCKET,
+        Key=minio_key(ds.rawzonePath),
+        Body=buf.getvalue().encode("utf-8-sig"),
+        ContentType="text/csv; charset=utf-8",
+    )
+    return True
+
+
 def process_file(path: str):
     ds, timings = construct_dataset(path, measure=True)
 
     input_relative_path = os.path.relpath(path, start=str(DATA_DIR)).replace("\\", "/")
-    copied = copy_input_object_to_rawzone(input_relative_path, ds.rawzonePath)
+    copied = upload_enriched_rawzone_if_available(ds)
+    if copied is None:
+        copied = copy_input_object_to_rawzone(input_relative_path, ds.rawzonePath)
 
     meta_dict = ds.to_dict()
     meta_entry = build_metadata_entry(path, ds)
-    meta_entry["rawzoneCopied"] = copied or object_exists("openlake", ds.rawzonePath)
+    meta_entry["rawzoneCopied"] = copied or ref_object_exists(ds.rawzonePath)
 
     perf_entry = None
     if not timings.get("timing_skipped"):

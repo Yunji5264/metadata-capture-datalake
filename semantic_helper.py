@@ -2,6 +2,8 @@ import os
 import json
 import io
 import pandas as pd
+import re
+import unicodedata
 from openai import OpenAI
 
 from reference import (
@@ -108,6 +110,73 @@ def save_semantic_backbone(series_hint: str, backbone: dict) -> None:
 # Prompt building
 # ---------------------------------------------------------
 
+_COUNTRY_COLUMN_HINTS = {
+    "country",
+    "pays",
+    "nation",
+    "etat",
+    "state",
+    "territoire_national",
+}
+
+_FRANCE_VALUE_ALIASES = {
+    "france",
+    "fr",
+    "fra",
+    "republique_francaise",
+    "republique_france",
+}
+
+
+def _normalize_semantic_token(value) -> str:
+    if pd.isna(value):
+        return ""
+    text = str(value).strip().lower()
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r"[^a-z0-9]+", "_", text)
+    return re.sub(r"_+", "_", text).strip("_")
+
+
+def _looks_like_country_column_name(col: str) -> bool:
+    norm = normalise_colname(col)
+    return norm in _COUNTRY_COLUMN_HINTS or any(
+        token in norm.split("_")
+        for token in ("country", "pays", "nation")
+    )
+
+
+def _is_france_country_series(series: pd.Series) -> bool:
+    values = {
+        _normalize_semantic_token(v)
+        for v in series.dropna().unique()
+        if _normalize_semantic_token(v)
+    }
+    return bool(values) and values.issubset(_FRANCE_VALUE_ALIASES)
+
+
+def _apply_country_spatial_overrides(out_df: pd.DataFrame, sample_df: pd.DataFrame) -> pd.DataFrame:
+    """Force real France/country columns to spatial after GPT/backbone inference."""
+    if out_df.empty:
+        return out_df
+
+    out_df = out_df.copy()
+    for idx, row in out_df.iterrows():
+        col = row.get("column_name")
+        if col not in sample_df.columns:
+            continue
+
+        if _looks_like_country_column_name(col) or _is_france_country_series(sample_df[col]):
+            out_df.at[idx, "meaning"] = row.get("meaning") or "Country spatial attribute."
+            out_df.at[idx, "is_spatial"] = True
+            out_df.at[idx, "is_temporal"] = False
+            out_df.at[idx, "is_indicator"] = False
+            out_df.at[idx, "is_other_information"] = False
+            out_df.at[idx, "indicator_type"] = None
+            out_df.at[idx, "thematic_path"] = None
+
+    return out_df
+
 def build_semantic_prompt(samples: dict) -> str:
     """
     Build the GPT prompt for semantic classification of one batch of columns.
@@ -116,7 +185,7 @@ def build_semantic_prompt(samples: dict) -> str:
 You are a rigorous data steward. Classify each column using header names and sample values.
 
 Allowed classes (mutually exclusive; exactly one must be True):
-- Spatial: encodes a location (latitude/longitude, X/Y, address, admin code, region/department names or codes).
+- Spatial: encodes a location (country/pays, latitude/longitude, X/Y, address, admin code, region/department names or codes).
 - Temporal: encodes time or period (year, date, month, quarter, week, YYYY, YYYY-MM, timestamps).
 - Indicator: a measured variable used for analysis/monitoring (counts, rates, ratios, scores, categories, yes/no flags).
 - Other information: ONLY if it is NOT spatial, NOT temporal, and NOT an indicator (e.g., labels, IDs, free text, entity attributes).
@@ -148,7 +217,7 @@ STRICT formatting of thematic_path:
 
 Decision steps (apply in order for each column):
 A) Detect class:
-   - If matches location patterns (geo codes/names, lon/lat, address): Spatial.
+   - If matches location patterns (country/pays values such as France, geo codes/names, lon/lat, address): Spatial.
    - Else if matches time patterns (year, date, month, etc.): Temporal.
    - Else if looks like a measure (numeric or categorical outcome used for analysis): Indicator.
    - Else: Other information.
@@ -402,6 +471,7 @@ def semantic_helper(
         ])
 
     if not out_df.empty:
+        out_df = _apply_country_spatial_overrides(out_df, df_sample)
         out_df["column_name_normalized"] = out_df["column_name"].apply(normalise_colname)
 
     # Optional backbone update

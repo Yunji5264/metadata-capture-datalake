@@ -138,13 +138,55 @@ class Parameter(Attribute):
 
 # subclass：SpatialParameter
 class SpatialParameter(Parameter):
-    def __init__(self, dataName, dataDescription, dataType, spatialLevel):
+    def __init__(
+        self,
+        dataName,
+        dataDescription,
+        dataType,
+        spatialLevel,
+        contains_aggregate_values: Optional[bool] = None,
+        mixed_levels: Optional[List[str]] = None,
+        aggregate_values: Optional[List[Dict[str, Any]]] = None,
+        values_by_level: Optional[Dict[str, List[Any]]] = None,
+        insee_geo_object: Optional[List[str]] = None,
+        code_labels: Optional[Dict[str, Any]] = None,
+        source_code_column: Optional[str] = None,
+        value_level_map: Optional[Dict[str, str]] = None,
+        unmatched_values: Optional[List[str]] = None,
+    ):
         super().__init__(dataName, dataDescription, dataType)
         self.spatialLevel = spatialLevel
+        self.contains_aggregate_values = contains_aggregate_values
+        self.mixed_levels = mixed_levels
+        self.aggregate_values = aggregate_values
+        self.values_by_level = values_by_level
+        self.insee_geo_object = insee_geo_object
+        self.code_labels = code_labels
+        self.source_code_column = source_code_column
+        self.value_level_map = value_level_map
+        self.unmatched_values = unmatched_values
 
     def to_dict(self):
         data = super().to_dict()
         data["spatialLevel"] = self.spatialLevel
+        if self.contains_aggregate_values is not None:
+            data["contains_aggregate_values"] = self.contains_aggregate_values
+        if self.mixed_levels:
+            data["mixed_levels"] = self.mixed_levels
+        if self.aggregate_values:
+            data["aggregate_values"] = self.aggregate_values
+        if self.values_by_level:
+            data["values_by_level"] = self.values_by_level
+        if self.insee_geo_object:
+            data["insee_geo_object"] = self.insee_geo_object
+        if self.code_labels:
+            data["code_labels"] = self.code_labels
+        if self.source_code_column:
+            data["source_code_column"] = self.source_code_column
+        if self.value_level_map:
+            data["value_level_map"] = self.value_level_map
+        if self.unmatched_values:
+            data["unmatched_values"] = self.unmatched_values
         return data
 
     @classmethod
@@ -153,7 +195,16 @@ class SpatialParameter(Parameter):
             data["dataName"],
             data["dataDescription"],
             data["dataType"],
-            data["spatialLevel"]
+            data["spatialLevel"],
+            data.get("contains_aggregate_values"),
+            data.get("mixed_levels"),
+            data.get("aggregate_values"),
+            data.get("values_by_level"),
+            data.get("insee_geo_object"),
+            data.get("code_labels"),
+            data.get("source_code_column"),
+            data.get("value_level_map"),
+            data.get("unmatched_values"),
         )
 
 

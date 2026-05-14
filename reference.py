@@ -5,10 +5,10 @@ import re
 import boto3
 from botocore.client import Config
 
-S3_ENDPOINT = ""
-S3_ACCESS_KEY = ""
-S3_SECRET_KEY = ""
-LAKE_BUCKET = ""
+S3_ENDPOINT = "http://10.105.110.131:80"
+S3_ACCESS_KEY = "minio"
+S3_SECRET_KEY = "minio123"
+LAKE_BUCKET = "openlake"
 
 s3 = boto3.client(
     "s3",
@@ -114,6 +114,10 @@ HIER = {
             ("geometry", "wkt_geojson"),
             "latlon_pair",
             "address",
+        ],
+        [
+            "country",
+            "insee_geo",
         ],
     ],
     "temporal": [["year", "quarter", "month", "date"],["year", "week", "date"]]
@@ -519,6 +523,8 @@ THEME_FOLDER_STRUCTURE = {
 TEMP_NAME_PATTERNS = [
     ("quarter", re.compile(r"\b(?P<y>(18|19|20)\d{2})[\-_ ]?Q(?P<q>[1-4])\b", re.I)),
     ("quarter", re.compile(r"\bQ(?P<q>[1-4])[\-_ ]?(?P<y>(18|19|20)\d{2})\b", re.I)),
+    ("quarter", re.compile(r"\b(?P<y>(18|19|20)\d{2})[\-_ ]?T(?P<q>[1-4])\b", re.I)),
+    ("quarter", re.compile(r"\bT(?P<q>[1-4])[\-_ ]?(?P<y>(18|19|20)\d{2})\b", re.I)),
     ("semester", re.compile(r"\bS(?P<s>[12])[\-_ ]?(?P<y>(18|19|20)\d{2})\b", re.I)),
     ("semester", re.compile(r"\b(?P<y>(18|19|20)\d{2})[\-_ ]?S(?P<s>[12])\b", re.I)),
     ("week",    re.compile(r"\b(?P<y>(18|19|20)\d{2})[\-_ ]?W(?P<w>[0-5]\d)\b", re.I)),

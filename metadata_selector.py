@@ -7,6 +7,7 @@ import zipfile
 import pandas as pd
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 from collections.abc import Iterable
 
@@ -14,15 +15,18 @@ from uml_class import *
 from scope_detector import *
 from granularity_detector import *
 from theme_detector import collect_all_themes_set
-from semantic_helper import semantic_helper
 from attribute_classifier import classify_attributes_with_semantic_helper, find_geometry_columns
-from general_function import get_df, human_readable_size
+from general_function import get_df, human_readable_size, normalise_colname, norm_code, norm_name
+from spatial_detector import build_ref_sets, match_series_to_ref_levels
 
 from reference import (
     HIER,
+    SPATIAL_NAME_MAP,
+    ref_dict,
     REF_SEMANTIC,
     PERF_DIR,
     DATASET_SOURCE_REGISTRY,
+    read_csv_from_minio,
     read_excel_from_minio,
     read_json_from_minio,
     object_exists,
@@ -183,6 +187,21 @@ def transform_result(
         g = entry.get("granularity", default)
         return str(g) if g is not None else None
 
+    def _copy_spatial_extras(param: SpatialParameter, entry: Dict[str, Any]) -> None:
+        for key in (
+            "contains_aggregate_values",
+            "mixed_levels",
+            "aggregate_values",
+            "values_by_level",
+            "insee_geo_object",
+            "code_labels",
+            "source_code_column",
+            "value_level_map",
+            "unmatched_values",
+        ):
+            if key in entry:
+                setattr(param, key, entry[key])
+
     def _indicator_type(entry: Dict[str, Any]) -> Optional[str]:
         it = entry.get("indicatorType", entry.get("indicator_type"))
         return str(it) if it is not None else None
@@ -220,12 +239,16 @@ def transform_result(
 
     # Spatial attributes
     for att in atts_spatial:
-        dataset.add_spatial_parameter(
+        if _default_country_spatial_attribute(att):
+            continue
+
+        param = dataset.add_spatial_parameter(
             _name_preserve_list(att.get("columns")),
             _text(att.get("description")),
             _dtype_from_type(att.get("type")),
             _granularity(att, default="geocode")
         )
+        _copy_spatial_extras(param, att)
 
     # Temporal attributes
     for att in atts_temporal:
@@ -300,11 +323,288 @@ def _collect_values(df, cols):
         return set()
 
 
-def get_dataset_scopes_gras(df, atts_spatial, atts_temporal):
+def _spatial_levels_from_attributes(atts_spatial) -> List[str]:
+    """Return detected spatial levels, including mixed levels in one column."""
+    levels: List[str] = []
+    for att in atts_spatial:
+        mixed_levels = att.get("mixed_levels") or []
+        if mixed_levels:
+            levels.extend(str(level) for level in mixed_levels if level)
+            continue
+        gra = att.get("granularity")
+        if gra:
+            levels.append(gra)
+    return levels
+
+
+def _collect_spatial_scope_values(df, att: dict, level: str):
+    """
+    Collect values for a spatial scope level.
+
+    For mixed-level columns, prefer the pre-classified values for the exact
+    scope level so aggregate labels like 'France' are not emitted as region
+    or departement values.
+    """
+    values_by_level = att.get("values_by_level") or {}
+    if level in values_by_level:
+        return list(values_by_level.get(level) or [])
+    return list(_collect_values(df, att["columns"]))
+
+
+def _dedupe_spatial_scopes(scopes: List[DSSpatialScope]) -> List[DSSpatialScope]:
+    """Merge duplicate scope entries at the same level while preserving order."""
+    merged: Dict[str, List[Any]] = {}
+    for scope in scopes:
+        level = scope.spatialScopeLevel
+        merged.setdefault(level, [])
+        for value in scope.spatialScope or []:
+            if value not in merged[level]:
+                merged[level].append(value)
+    return [DSSpatialScope(level, values) for level, values in merged.items()]
+
+
+_FILENAME_SPATIAL_LEVEL_ALIASES = [
+    ("arr_dep", ("arr_dep", "arrondissement_departemental", "arrondissement_dep")),
+    ("com_arr", ("com_arr", "arrondissement_communal", "arrondissement_com")),
+    ("dep", ("dep", "dpt", "departement", "department")),
+    ("reg", ("reg", "region")),
+    ("academie", ("academie", "acad")),
+    ("epci", ("epci",)),
+    ("canton", ("canton",)),
+    ("com", ("com", "commune", "insee")),
+    ("iris", ("iris",)),
+]
+
+
+def _default_country_spatial_attribute(att: dict) -> bool:
+    """Return True for the synthetic France fallback spatial attribute."""
+    return (
+        att.get("granularity") == "country"
+        and att.get("scope_values") == ["France"]
+        and str(att.get("type", "")).lower() == "constant"
+    )
+
+
+def _validated_filename_spatial_hints(filename: Optional[str]) -> List[dict]:
+    """
+    Extract spatial hints from a filename using explicit level aliases.
+
+    Examples:
+      - 2020_detail_IDF_dep_75.csv -> departement 75
+      - indicateur_region_11.csv -> region 11
+    """
+    if not filename or not ref_dict:
+        return []
+
+    text = normalise_colname(Path(str(filename)).stem)
+    ref_sets = build_ref_sets(ref_dict)
+    hits: List[dict] = []
+
+    for raw_level, aliases in _FILENAME_SPATIAL_LEVEL_ALIASES:
+        if raw_level not in ref_sets:
+            continue
+
+        valid_codes = ref_sets[raw_level].get("codes", set()) or set()
+        code_lengths = sorted({len(c) for c in valid_codes}, reverse=True)
+
+        for alias in aliases:
+            pat = re.compile(
+                rf"(?:^|_){re.escape(alias)}_?(?P<code>2a|2b|[0-9a-z]{{1,9}})(?:_|$)",
+                re.I,
+            )
+            for match in pat.finditer(text):
+                raw_code = norm_code(match.group("code"))
+                candidates = [raw_code]
+                if raw_code.isdigit():
+                    candidates.extend(
+                        raw_code.zfill(length)
+                        for length in code_lengths
+                        if length >= len(raw_code)
+                    )
+
+                value = next((c for c in candidates if c in valid_codes), None)
+                if not value:
+                    continue
+
+                level = SPATIAL_NAME_MAP.get(raw_level, raw_level)
+                hits.append({
+                    "granularity": level,
+                    "value": value,
+                    "confidence": 0.96,
+                    "evidence": f"Filename fallback: detected {level} code '{value}'.",
+                })
+
+    uniq = {(h["granularity"], h["value"]): h for h in hits}
+    return list(uniq.values())
+
+
+def _unique_metadata_column_name(df: pd.DataFrame, base: str) -> str:
+    """Return a stable metadata-derived column name that does not collide."""
+    name = base
+    i = 2
+    while name in df.columns:
+        name = f"{base}_{i}"
+        i += 1
+    return name
+
+
+def add_filename_scope_columns(
+    df: pd.DataFrame,
+    filename: Optional[str],
+    atts_spatial: List[dict],
+    atts_temporal: List[dict],
+) -> tuple[pd.DataFrame, List[dict], List[dict], Dict[str, Any]]:
+    """
+    Materialize filename-derived temporal/spatial hints as constant raw-zone columns.
+
+    This is used only when the dataset has no real parameter for the corresponding
+    dimension. It makes downstream extraction faster because Step 2 can filter real
+    columns instead of rebuilding virtual parameters from dataset scope.
+    """
+    enrichment: Dict[str, Any] = {"temporal": [], "spatial": []}
+    if df is None or not filename:
+        return df, atts_spatial, atts_temporal, enrichment
+
+    has_temporal_parameter = any(att.get("granularity") for att in atts_temporal)
+    has_real_spatial_parameter = any(
+        att.get("granularity") and not _default_country_spatial_attribute(att)
+        for att in atts_spatial
+    )
+
+    if not has_temporal_parameter:
+        temporal_hints = extract_temporal_hints_from_text(filename)
+        hint_gras = [h["granularity"] for h in temporal_hints]
+        temporal_level = get_granularity(hint_gras, HIER["temporal"])
+
+        if temporal_level:
+            values = list(dict.fromkeys(
+                h["value"]
+                for h in temporal_hints
+                if h["granularity"] == temporal_level and h.get("value")
+            ))
+            if values:
+                col = _unique_metadata_column_name(
+                    df,
+                    f"METADATA_TEMPORAL_{str(temporal_level).upper()}",
+                )
+                value = values[0]
+                df[col] = value
+                entry = {
+                    "columns": col,
+                    "description": f"Temporal parameter derived from dataset filename '{filename}'.",
+                    "type": "constant",
+                    "granularity": temporal_level,
+                    "scope_values": values,
+                    "confidence": 0.95,
+                    "matched_by": "filename_temporal_hint_materialized",
+                    "evidence": f"Filename contains {temporal_level} value '{value}'.",
+                }
+                atts_temporal.append(entry)
+                enrichment["temporal"].append(entry)
+
+    if not has_real_spatial_parameter:
+        spatial_hints = _validated_filename_spatial_hints(filename)
+        hint_gras = [h["granularity"] for h in spatial_hints]
+        spatial_level = get_granularity(hint_gras, HIER["spatial"])
+
+        if spatial_level:
+            values = list(dict.fromkeys(
+                h["value"]
+                for h in spatial_hints
+                if h["granularity"] == spatial_level and h.get("value")
+            ))
+            if values:
+                col = _unique_metadata_column_name(
+                    df,
+                    f"METADATA_SPATIAL_{str(spatial_level).upper()}",
+                )
+                value = values[0]
+                df[col] = value
+                entry = {
+                    "columns": col,
+                    "description": f"Spatial parameter derived from dataset filename '{filename}'.",
+                    "type": "constant",
+                    "granularity": spatial_level,
+                    "scope_values": values,
+                    "confidence": 0.96,
+                    "matched_by": "filename_spatial_hint_materialized",
+                    "evidence": f"Filename contains {spatial_level} value '{value}'.",
+                }
+                atts_spatial = [
+                    att
+                    for att in atts_spatial
+                    if not _default_country_spatial_attribute(att)
+                ]
+                atts_spatial.append(entry)
+                enrichment["spatial"].append(entry)
+
+    return df, atts_spatial, atts_temporal, enrichment
+
+
+def _apply_filename_scope_fallbacks(
+    filename: Optional[str],
+    spatial_scope: List[DSSpatialScope],
+    temporal_scope: List[DSTemporalScope],
+    spatial_granularity: Optional[str],
+    temporal_granularity: Optional[str],
+    atts_spatial,
+    atts_temporal,
+):
+    """Use filename hints only when real dataset parameters are unavailable."""
+    has_real_spatial_parameter = any(
+        att.get("granularity") and not _default_country_spatial_attribute(att)
+        for att in atts_spatial
+    )
+    has_temporal_parameter = any(att.get("granularity") for att in atts_temporal)
+
+    if filename and not has_temporal_parameter:
+        temporal_hints = extract_temporal_hints_from_text(filename)
+        hint_gras = [h["granularity"] for h in temporal_hints]
+        fallback_temporal_granularity = get_granularity(hint_gras, HIER["temporal"])
+
+        if fallback_temporal_granularity:
+            values = [
+                h["value"]
+                for h in temporal_hints
+                if h["granularity"] == fallback_temporal_granularity
+            ]
+            ranges = extract_label_ranges(fallback_temporal_granularity, values)
+            if ranges:
+                temporal_scope = [DSTemporalScope(fallback_temporal_granularity, ranges)]
+                temporal_granularity = fallback_temporal_granularity
+
+    if filename and not has_real_spatial_parameter:
+        spatial_hints = _validated_filename_spatial_hints(filename)
+        hint_gras = [h["granularity"] for h in spatial_hints]
+        fallback_spatial_granularity = get_granularity(hint_gras, HIER["spatial"])
+        fallback_scope_levels = get_scope(hint_gras, HIER["spatial"])
+
+        if fallback_spatial_granularity:
+            spatial_granularity = fallback_spatial_granularity
+
+        if fallback_scope_levels:
+            spatial_scope = [
+                sc
+                for sc in spatial_scope
+                if getattr(sc, "spatialScopeLevel", None) != "country"
+            ]
+            for level in fallback_scope_levels:
+                values = [
+                    h["value"]
+                    for h in spatial_hints
+                    if h["granularity"] == level
+                ]
+                if values:
+                    spatial_scope.append(DSSpatialScope(level, list(dict.fromkeys(values))))
+
+    return spatial_scope, temporal_scope, spatial_granularity, temporal_granularity
+
+
+def get_dataset_scopes_gras(df, atts_spatial, atts_temporal, filename: Optional[str] = None):
     """
     Compute spatial and temporal scopes and final granularities for a dataset.
     """
-    spatial_gras = [att["granularity"] for att in atts_spatial if att.get("granularity")]
+    spatial_gras = _spatial_levels_from_attributes(atts_spatial)
     temporal_gras = [att["granularity"] for att in atts_temporal if att.get("granularity")]
 
     spatial_scope_level = get_scope(spatial_gras, HIER["spatial"])
@@ -326,7 +626,7 @@ def get_dataset_scopes_gras(df, atts_spatial, atts_temporal):
 
             # Standard label-based spatial scope
             if gra not in {"geometry", "geopoint", "latlon_pair"}:
-                values = list(_collect_values(df, att["columns"]))
+                values = _collect_spatial_scope_values(df, att, gra)
                 spatial_scope.append(DSSpatialScope(gra, values))
                 continue
 
@@ -368,6 +668,13 @@ def get_dataset_scopes_gras(df, atts_spatial, atts_temporal):
             values = _geometry_values_as_wkt(agg)
             spatial_scope.append(DSSpatialScope("geometry_extent", values))
 
+        for mixed_level in att.get("mixed_levels") or []:
+            if mixed_level in spatial_scope_level and mixed_level != gra:
+                values = _collect_spatial_scope_values(df, att, mixed_level)
+                spatial_scope.append(DSSpatialScope(mixed_level, values))
+
+    spatial_scope = _dedupe_spatial_scopes(spatial_scope)
+
     # Build temporal scope
     for att in atts_temporal:
         gra = att.get("granularity")
@@ -376,7 +683,15 @@ def get_dataset_scopes_gras(df, atts_spatial, atts_temporal):
             ranges = extract_label_ranges(gra, tokens)
             temporal_scope.append(DSTemporalScope(gra, ranges))
 
-    return spatial_scope, temporal_scope, spatial_granularity, temporal_granularity
+    return _apply_filename_scope_fallbacks(
+        filename,
+        spatial_scope,
+        temporal_scope,
+        spatial_granularity,
+        temporal_granularity,
+        atts_spatial,
+        atts_temporal,
+    )
 
 
 # =========================================================
@@ -489,6 +804,369 @@ def theme_path_to_rawzone_path(theme_path: str, filename: str) -> str:
 
 
 # =========================================================
+# INSEE sidecar code-list helpers
+# =========================================================
+
+def _insee_metadata_path_for_data_path(path: str) -> Optional[str]:
+    """Return the expected INSEE *_metadata.csv sidecar path for a *_data.csv file."""
+    key = minio_key(path)
+    dirname, filename = key.rsplit("/", 1) if "/" in key else ("", key)
+
+    candidates = []
+    if filename.endswith("_data.csv"):
+        candidates.append(filename[:-len("_data.csv")] + "_metadata.csv")
+    if filename.endswith("_data.CSV"):
+        candidates.append(filename[:-len("_data.CSV")] + "_metadata.CSV")
+
+    for candidate in candidates:
+        sidecar = f"{dirname}/{candidate}" if dirname else candidate
+        if object_exists(sidecar):
+            return sidecar
+
+    return None
+
+
+def _read_insee_metadata_sidecar(path: str) -> Optional[pd.DataFrame]:
+    """Read an INSEE code-list sidecar if it exists and has the expected schema."""
+    sidecar = _insee_metadata_path_for_data_path(path)
+    if not sidecar:
+        return None
+
+    try:
+        meta = read_csv_from_minio(sidecar, dtype=str, sep=";")
+    except Exception:
+        return None
+
+    meta.columns = [str(c).strip().strip('"') for c in meta.columns]
+    required = {"COD_VAR", "LIB_VAR", "COD_MOD", "LIB_MOD"}
+    if not required.issubset(set(meta.columns)):
+        return None
+
+    return meta.fillna("")
+
+
+def _normalise_insee_code(value: Any) -> str:
+    text = str(value).strip().strip('"')
+    if not text:
+        return ""
+    if re.fullmatch(r"\d+", text):
+        return str(int(text))
+    return text.upper()
+
+
+def _code_label_map_for_var(meta: pd.DataFrame, var: str) -> Dict[str, str]:
+    sub = meta.loc[meta["COD_VAR"].astype(str).str.strip() == var]
+    out: Dict[str, str] = {}
+    for _, row in sub.iterrows():
+        code = str(row.get("COD_MOD", "")).strip()
+        label = str(row.get("LIB_MOD", "")).strip()
+        if code:
+            out[_normalise_insee_code(code)] = label
+    return out
+
+
+def _insee_geo_object_values(df: pd.DataFrame) -> List[str]:
+    if "GEO_OBJECT" not in df.columns:
+        return []
+    values = [
+        str(v).strip()
+        for v in df["GEO_OBJECT"].dropna().drop_duplicates().tolist()
+        if str(v).strip()
+    ]
+    return values[:20]
+
+
+def _unique_column_name(df: pd.DataFrame, base: str) -> str:
+    """Return a column name that does not already exist in the dataframe."""
+    if base not in df.columns:
+        return base
+    i = 2
+    while f"{base}_{i}" in df.columns:
+        i += 1
+    return f"{base}_{i}"
+
+
+def add_insee_geo_label_column_from_sidecar(
+    df: pd.DataFrame,
+    path: str,
+) -> tuple[pd.DataFrame, Optional[Dict[str, Any]]]:
+    """
+    Add a real label column for INSEE dataset-specific GEO codes.
+
+    The original GEO code column is kept unchanged. The new GEO_LABEL column is
+    the value that should be used by downstream filtering when the numeric GEO
+    code has a dataset-specific meaning declared in *_metadata.csv.
+    """
+    if df is None or "GEO" not in df.columns:
+        return df, None
+
+    meta = _read_insee_metadata_sidecar(path)
+    if meta is None:
+        return df, None
+
+    label_by_code = _code_label_map_for_var(meta, "GEO")
+    if not label_by_code:
+        return df, None
+
+    values = [
+        str(v).strip().strip('"')
+        for v in df["GEO"].dropna().drop_duplicates().tolist()
+        if str(v).strip()
+    ]
+    if not values:
+        return df, None
+
+    matched = [
+        value
+        for value in values
+        if _normalise_insee_code(value) in label_by_code
+    ]
+    if len(matched) / max(1, len(values)) < 0.8:
+        return df, None
+
+    out = df.copy()
+    label_col = _unique_column_name(out, "GEO_LABEL")
+    out[label_col] = out["GEO"].map(
+        lambda v: label_by_code.get(_normalise_insee_code(v), "")
+        if pd.notna(v) and str(v).strip()
+        else ""
+    )
+
+    code_labels = {
+        value: label_by_code.get(_normalise_insee_code(value), "")
+        for value in values
+    }
+    info = {
+        "code_column": "GEO",
+        "label_column": label_col,
+        "code_labels": code_labels,
+        "insee_geo_object": _insee_geo_object_values(out),
+        "sidecar_path": _insee_metadata_path_for_data_path(path),
+    }
+    return out, info
+
+
+def _infer_spatial_level_for_insee_geo_label(
+    df: pd.DataFrame,
+    label_col: str,
+    *,
+    min_ratio: float = 0.8,
+) -> Dict[str, Any]:
+    """
+    Infer the real reference spatial level for an INSEE GEO_LABEL column.
+
+    Once GEO codes are resolved to labels, the labels can often be matched to
+    ref_spatial names. In that case the column is no longer an opaque insee_geo
+    code-list; it is a normal region/departement/commune/etc. parameter.
+    """
+    if label_col not in df.columns:
+        return {}
+
+    try:
+        ref_sets = build_ref_sets(ref_dict)
+        best = match_series_to_ref_levels(df[label_col], ref_sets)
+    except Exception:
+        return {}
+
+    if not best or float(best.get("ratio") or 0.0) < min_ratio:
+        return {}
+
+    return best
+
+
+def _infer_mixed_spatial_levels_for_insee_geo_label(
+    df: pd.DataFrame,
+    label_col: str,
+) -> Dict[str, Any]:
+    """
+    Match each GEO_LABEL value to ref_spatial levels.
+
+    Some INSEE GEO code-lists mix communes, EPCI and other administrative
+    levels in the same GEO column. This returns per-level values so dataset
+    scope and downstream filtering can choose the useful level later.
+    """
+    if label_col not in df.columns:
+        return {}
+
+    try:
+        ref_sets = build_ref_sets(ref_dict)
+    except Exception:
+        return {}
+
+    values = [
+        str(v).strip()
+        for v in df[label_col].dropna().drop_duplicates().tolist()
+        if str(v).strip()
+    ]
+    if not values:
+        return {}
+
+    level_order = [
+        "country",
+        "region",
+        "academie",
+        "departement",
+        "arrondissement_departemental",
+        "epci",
+        "canton",
+        "commune",
+        "arrondissement_communal",
+        "iris",
+    ]
+    level_rank = {level: idx for idx, level in enumerate(level_order)}
+
+    values_by_level: Dict[str, List[str]] = {}
+    unmatched: List[str] = []
+    value_level_map: Dict[str, str] = {}
+
+    for value in values:
+        value_name = norm_name(value)
+        hits: List[str] = []
+        for raw_level, sets in ref_sets.items():
+            level = SPATIAL_NAME_MAP.get(raw_level, raw_level)
+            if value_name and value_name in (sets.get("names", set()) or set()):
+                hits.append(level)
+
+        if not hits:
+            unmatched.append(value)
+            continue
+
+        # If one label exists at several levels, keep the most specific one.
+        # The original label remains unchanged in values_by_level.
+        chosen = sorted(hits, key=lambda x: level_rank.get(x, -1), reverse=True)[0]
+        values_by_level.setdefault(chosen, []).append(value)
+        value_level_map[value] = chosen
+
+    mixed_levels = [
+        level
+        for level in level_order
+        if values_by_level.get(level)
+    ]
+
+    if not mixed_levels:
+        return {}
+
+    total = len(values)
+    matched = total - len(unmatched)
+    return {
+        "mixed_levels": mixed_levels,
+        "values_by_level": values_by_level,
+        "value_level_map": value_level_map,
+        "unmatched_values": unmatched[:200],
+        "match_ratio": matched / total if total else 0.0,
+    }
+
+
+def enrich_insee_spatial_attributes_from_sidecar(
+    df: pd.DataFrame,
+    path: str,
+    atts_spatial: List[dict],
+    atts_other: List[dict],
+    enrichment_info: Optional[Dict[str, Any]] = None,
+) -> tuple[List[dict], List[dict]]:
+    """
+    Detect INSEE dataset-specific GEO code-list columns.
+
+    INSEE CSV packages often encode geography as GEO codes whose meanings are
+    declared in the sibling *_metadata.csv file. Those codes are not
+    administrative codes, so reference-spatial matching must not reinterpret
+    them as region/departement/commune.
+    """
+    if "GEO" not in df.columns:
+        return atts_spatial, atts_other
+
+    if enrichment_info is None:
+        df, enrichment_info = add_insee_geo_label_column_from_sidecar(df, path)
+    if not enrichment_info:
+        return atts_spatial, atts_other
+
+    code_col = enrichment_info.get("code_column", "GEO")
+    label_col = enrichment_info.get("label_column", "GEO_LABEL")
+    if label_col not in df.columns:
+        return atts_spatial, atts_other
+
+    values = [
+        str(v).strip()
+        for v in df[label_col].dropna().drop_duplicates().tolist()
+        if str(v).strip()
+    ]
+    mixed = _infer_mixed_spatial_levels_for_insee_geo_label(df, label_col)
+    inferred = _infer_spatial_level_for_insee_geo_label(df, label_col) if not mixed else {}
+
+    if mixed and len(mixed.get("mixed_levels") or []) > 1:
+        spatial_level = "mixed"
+        matched_by = "insee_metadata_sidecar_label_mixed_ref_spatial"
+        confidence = min(0.99, max(0.80, float(mixed.get("match_ratio") or 0.0)))
+        scope_values = values
+    elif mixed and len(mixed.get("mixed_levels") or []) == 1:
+        spatial_level = mixed["mixed_levels"][0]
+        matched_by = "insee_metadata_sidecar_label_ref_spatial"
+        confidence = min(0.99, max(0.80, float(mixed.get("match_ratio") or 0.0)))
+        scope_values = mixed.get("values_by_level", {}).get(spatial_level, values)
+    else:
+        spatial_level = inferred.get("level") or "insee_geo"
+        matched_by = (
+            f"insee_metadata_sidecar_label_{inferred.get('by')}"
+            if inferred
+            else "insee_metadata_sidecar"
+        )
+        confidence = min(0.99, max(0.80, float(inferred.get("ratio") or 0.98))) if inferred else 0.98
+        scope_values = values
+
+    entry = {
+        "columns": label_col,
+        "description": "INSEE dataset-specific geography label resolved from GEO and *_metadata.csv",
+        "type": str(df[label_col].dtype),
+        "granularity": spatial_level,
+        "confidence": confidence,
+        "matched_by": matched_by,
+        "scope_values": scope_values,
+        "insee_geo_object": enrichment_info.get("insee_geo_object", []),
+        "code_labels": enrichment_info.get("code_labels", {}),
+        "source_code_column": code_col,
+        "contains_aggregate_values": spatial_level == "mixed",
+        "mixed_levels": mixed.get("mixed_levels", []) if mixed else [],
+        "values_by_level": mixed.get("values_by_level", {}) if mixed else {},
+        "value_level_map": mixed.get("value_level_map", {}) if mixed else {},
+        "unmatched_values": mixed.get("unmatched_values", []) if mixed else [],
+        "evidence": (
+            f"GEO values were resolved to {label_col} using the sibling INSEE *_metadata.csv code-list; "
+            f"{label_col} contains mixed ref_spatial levels: {', '.join(mixed.get('mixed_levels', []))}."
+            if mixed and spatial_level == "mixed"
+            else (
+                f"GEO values were resolved to {label_col} using the sibling INSEE *_metadata.csv code-list; "
+                f"{label_col} matched ref_spatial level '{spatial_level}'."
+                if inferred or mixed
+                else "GEO values were resolved to labels using the sibling INSEE *_metadata.csv code-list, but labels did not match a ref_spatial level."
+            )
+        ),
+    }
+
+    updated_spatial = []
+    replaced = False
+    for att in atts_spatial:
+        cols = att.get("columns")
+        cols_list = cols if isinstance(cols, list) else [cols]
+        if code_col in cols_list or label_col in cols_list:
+            updated_spatial.append({**att, **entry})
+            replaced = True
+        else:
+            updated_spatial.append(att)
+
+    if not replaced:
+        updated_spatial.append(entry)
+
+    updated_other = []
+    for att in atts_other:
+        cols = att.get("columns")
+        cols_list = cols if isinstance(cols, list) else [cols]
+        if code_col not in cols_list and label_col not in cols_list:
+            updated_other.append(att)
+
+    return updated_spatial, updated_other
+
+
+# =========================================================
 # Main dataset construction pipeline
 # =========================================================
 
@@ -508,6 +1186,8 @@ def construct_dataset(path: str, measure: bool = True):
     - Governance resources such as registry, semantic cache and perf cache
       are also read from / written to MinIO.
     """
+    from semantic_helper import semantic_helper
+
     title = path.split("/")[-1]
     source_info = get_source_info_for_file(title)
     series_hint = source_info.get("filename_series_hint", "") or None
@@ -531,6 +1211,7 @@ def construct_dataset(path: str, measure: bool = True):
     # Read the full dataset from MinIO
     t0 = time.perf_counter()
     df, ext, data_format = get_df(path)
+    df, insee_geo_enrichment = add_insee_geo_label_column_from_sidecar(df, path)
     timings["read_df_sec"] = time.perf_counter() - t0
 
     # Load semantic cache from MinIO if available.
@@ -579,11 +1260,24 @@ def construct_dataset(path: str, measure: bool = True):
     atts_temporal = results.get("temporal", []) or []
     atts_indicator = results.get("indicators", results.get("indicator", [])) or []
     atts_other = results.get("other", []) or []
+    atts_spatial, atts_other = enrich_insee_spatial_attributes_from_sidecar(
+        df,
+        path,
+        atts_spatial,
+        atts_other,
+        insee_geo_enrichment,
+    )
+    df, atts_spatial, atts_temporal, filename_scope_enrichment = add_filename_scope_columns(
+        df,
+        title,
+        atts_spatial,
+        atts_temporal,
+    )
     atts_theme = atts_indicator + atts_other
 
     # Scope and granularity detection
     t0 = time.perf_counter()
-    ss, ts, sg, tg = get_dataset_scopes_gras(df, atts_spatial, atts_temporal)
+    ss, ts, sg, tg = get_dataset_scopes_gras(df, atts_spatial, atts_temporal, filename=title)
     timings["scopes_granularities_sec"] = time.perf_counter() - t0
 
     # Theme aggregation and raw-zone path derivation
@@ -629,6 +1323,12 @@ def construct_dataset(path: str, measure: bool = True):
         nFeatures=n_features,
         uncompressedSizeBytes=unzipped_size
     )
+    if insee_geo_enrichment or filename_scope_enrichment.get("temporal") or filename_scope_enrichment.get("spatial"):
+        dataset._rawzone_enriched_df = df
+        dataset._rawzone_enrichment = {
+            "insee_geo": insee_geo_enrichment,
+            "filename_scope": filename_scope_enrichment,
+        }
 
     # Transform classified attributes into Dataset attributes
     t0 = time.perf_counter()
